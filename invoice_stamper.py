@@ -1,62 +1,30 @@
-﻿from tkinter import _test
 import os
 import shutil
 import fitz  # PyMuPDF library  # type: ignore
 from datetime import datetime
+import socket
+import getpass
+import hashlib
 from PIL import Image, ImageTk
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 
-# GL Code to Description mappings based on accounting legends
-GL_MAPPING = {
-    "1494": "Shop Supplies",
-    "1502": "Prepaid Advertising",
-    "1762": "Furniture & Fixtures",
-    "1786": "Computer Equipment",
-    "6014": "Advertising",
-    "6015": "Sales Promotion",
-    "6047": "Express Freight",
-    "6051": "Data Processing",
-    "6052": "Office Supply",
-    "6053": "Telephone",
-    "6054": "Travel",
-    "6055": "Membership",
-    "6084": "Building Maintenance",
-    "6103": "Shop Supplies",
-    "2803": "Uniform",
-    "9003": "Repair Equipment",
-    "8200": "Maintenance Building",
-    "7900": "Software/Data Processing",
-    "6000": "Office Supplies",
-    "7000": "Travel",
-    "7700": "Training",
-    "3200": "Subscription / Membership",
-    "28200": "Computer Equipment",
-    "64420": "Shop Supplies",
-    "64430": "Uniform",
-    "64630": "Repair Equipment",
-    "60840": "Maintenance Building",
-    "60510": "Software/Data Processing",
-    "60520": "Office Supplies",
-    "60450": "Travel",
-    "64440": "Training",
-    "60140": "Subscription / Membership",
-    "17420": "Computer Equipment"
-}
-
-# Location Mappings
-LOCATIONS = {
-    "JLR": "M1304-JLR00",
-    "ALFA/MAS": "M1844",
-    "AO": "M",
-    "AWO": "H",
-    "PORSCHE": "P",
-    "AUDI CITY": "L",
-    "MERCEDES": "GMB",
-    "CORNWALL VW": "CCVW",
-    "GATINEAU VW": "GVW"
-}
+# Known Location Names for Reference
+KNOWN_LOCATIONS = [
+    "Alfa-Mas",
+    "Audi City Ottawa",
+    "Audi Ottawa",
+    "Audi West Ottawa",
+    "Cornwall Centre Volkswagen",
+    "INEOS",
+    "JLR",
+    "Mercedes-Benz",
+    "MMG",
+    "Porsche",
+    "Split",
+    "Volkswagen de l'Outaouais"
+]
 
 class MonthSelector(tb.Toplevel):
     def __init__(self, parent, base_path):
@@ -105,13 +73,7 @@ class MonthSelector(tb.Toplevel):
         selected = self.month_var.get()
         if selected:
             path = os.path.join(self.base_path, selected)
-            locations_dir = os.path.join(path, "Locations")
-            
-            # Auto-create Locations folder if it doesn't exist
-            if not os.path.exists(locations_dir):
-                os.makedirs(locations_dir)
-                
-            self.result = (path, locations_dir)
+            self.result = path
             self.destroy()
 
     def center_on_screen(self):
@@ -129,29 +91,9 @@ class InvoiceStamperApp:
         self.root.geometry("1400x900")
         
         self.month_path = month_path
-        locations_dir = os.path.join(month_path, "Locations")
-        
         self.pdf_files = []
         
-        if os.path.exists(locations_dir):
-            for loc_folder in os.listdir(locations_dir):
-                if loc_folder.lower() == "approved":
-                    continue
-                loc_path = os.path.join(locations_dir, loc_folder)
-                if os.path.isdir(loc_path):
-                    for f in os.listdir(loc_path):
-                        if f.lower().endswith('.pdf'):
-                            base, ext = os.path.splitext(f)
-                            base_lower = base.lower().strip()
-                            if base_lower.endswith('approved') or base_lower.endswith('denyed') or base_lower.endswith('denied'):
-                                continue
-                            self.pdf_files.append({
-                                "abs_path": os.path.join(loc_path, f),
-                                "filename": f,
-                                "location": loc_folder
-                            })
-        else:
-            messagebox.showerror("Error", f"Locations directory '{locations_dir}' does not exist.")
+        self._load_pending_invoices()
             
         self.current_index = 0
         self.current_pdf_doc = None  
@@ -179,6 +121,79 @@ class InvoiceStamperApp:
         
         self.setup_ui()
         self.load_current_pdf()
+
+    def _load_pending_invoices(self):
+        """Scans all location directories in month_path (or month_path/Locations) for pending PDF files."""
+        self.pdf_files = []
+        if not os.path.exists(self.month_path):
+            messagebox.showerror("Error", f"Month directory '{self.month_path}' does not exist.")
+            return
+
+        # Discover all location directories
+        location_folders = [] # List of (location_name, loc_path)
+        
+        # 1. Check if there is a Locations subfolder
+        for item in sorted(os.listdir(self.month_path)):
+            sub = os.path.join(self.month_path, item)
+            if os.path.isdir(sub) and item.lower() == "locations":
+                for loc in sorted(os.listdir(sub)):
+                    loc_path = os.path.join(sub, loc)
+                    if os.path.isdir(loc_path) and loc.lower() not in ["approved", "denyed", "denied", "original", "originals"]:
+                        location_folders.append((loc, loc_path))
+                        
+        # 2. Check location directories directly in month_path (e.g. 06_June\Alfa-Mas)
+        for item in sorted(os.listdir(self.month_path)):
+            loc_path = os.path.join(self.month_path, item)
+            if not os.path.isdir(loc_path):
+                continue
+            if item.lower() in ["locations", "approved", "denyed", "denied", "original", "originals", ".git", "venv", "__pycache__"]:
+                continue
+            # Avoid duplicate if already added
+            if not any(lp == loc_path for _, lp in location_folders):
+                location_folders.append((item, loc_path))
+                
+        # Scan files in each discovered location directory
+        for loc_name, loc_path in location_folders:
+            for f in sorted(os.listdir(loc_path)):
+                file_abs = os.path.join(loc_path, f)
+                if os.path.isdir(file_abs):
+                    continue
+                if not f.lower().endswith('.pdf'):
+                    continue
+                
+                # Skip files that have already been marked approved or denied in their name
+                base, ext = os.path.splitext(f)
+                base_lower = base.lower().strip()
+                if base_lower.endswith('approved') or base_lower.endswith('denyed') or base_lower.endswith('denied'):
+                    continue
+                
+                # Check if an original copy already exists in original/ subfolder
+                orig_path = os.path.join(loc_path, "original", f)
+                if os.path.exists(orig_path):
+                    continue
+                    
+                # Check if file has already been signed/stamped with Liza Mrak metadata
+                try:
+                    doc = fitz.open(file_abs)
+                    rc, val = doc.xref_get_key(-1, "Info")
+                    is_already_stamped = False
+                    if rc == "xref":
+                        info_xref = int(val.replace("0 R", "").strip())
+                        _, approved_by = doc.xref_get_key(info_xref, "ApprovedBy")
+                        if approved_by and approved_by != "null" and "Liza" in approved_by:
+                            is_already_stamped = True
+                    doc.close()
+                    if is_already_stamped:
+                        continue
+                except Exception:
+                    pass
+
+                self.pdf_files.append({
+                    "abs_path": file_abs,
+                    "filename": f,
+                    "location": loc_name,
+                    "location_path": loc_path
+                })
 
     def setup_ui(self):
         # Header with Logo
@@ -227,7 +242,7 @@ class InvoiceStamperApp:
         # Global mousewheel binding
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
-        # --- Right Frame: Form Inputs ---
+        # --- Right Frame: Form Inputs & Actions ---
         self.right_frame = tb.Frame(self.main_container, padding=20)
         self.right_frame.grid(row=0, column=1, sticky="nsew")
 
@@ -265,7 +280,7 @@ class InvoiceStamperApp:
         self.filename_label = tb.Label(info_card, text="", font=("Helvetica", 11), wraplength=300)
         self.filename_label.pack(anchor="w", pady=(2, 10))
         
-        tb.Label(info_card, text="Staged Location:", font=("Helvetica", 10, "bold"), bootstyle="secondary").pack(anchor="w")
+        tb.Label(info_card, text="Location:", font=("Helvetica", 10, "bold"), bootstyle="secondary").pack(anchor="w")
         self.location_label = tb.Label(info_card, text="", font=("Helvetica", 11, "bold"), bootstyle="info")
         self.location_label.pack(anchor="w", pady=(2, 0))
 
@@ -273,14 +288,14 @@ class InvoiceStamperApp:
         
         # Approve Button (Big Green)
         self.approve_btn = tb.Button(
-            self.scroll_content, text="Γ£ô Approve", 
+            self.scroll_content, text="✓ Approve", 
             command=self.approve_pdf, bootstyle="success", width=25
         )
         self.approve_btn.pack(fill="x", pady=(0, 10), ipady=12)
 
         # Deny Button (Big Red)
         self.deny_btn = tb.Button(
-            self.scroll_content, text="Γ£ò Deny", 
+            self.scroll_content, text="✕ Deny", 
             command=self.deny_pdf, bootstyle="danger", width=25
         )
         self.deny_btn.pack(fill="x", pady=(0, 20), ipady=12)
@@ -292,20 +307,20 @@ class InvoiceStamperApp:
         self.nav_frame.pack(fill="x", pady=(10, 10))
         
         self.back_btn = tb.Button(
-            self.nav_frame, text="Γçá Go Back", 
+            self.nav_frame, text="← Go Back", 
             command=self.go_back, bootstyle="outline-secondary"
         )
         self.back_btn.pack(side="left", expand=True, fill="x", padx=(0, 5), ipady=8)
 
         self.skip_btn = tb.Button(
-            self.nav_frame, text="Skip Γçó", 
+            self.nav_frame, text="Skip →", 
             command=self.skip_pdf, bootstyle="outline-secondary"
         )
         self.skip_btn.pack(side="right", expand=True, fill="x", padx=(5, 0), ipady=8)
 
         # Finish Button
         self.finish_btn = tb.Button(
-            self.scroll_content, text="Γ£ò Finish & Close", 
+            self.scroll_content, text="✓ Finish & Close", 
             command=self.root.destroy, bootstyle="outline-danger", width=25
         )
         self.finish_btn.pack(fill="x", pady=(20, 0), ipady=12)
@@ -313,6 +328,7 @@ class InvoiceStamperApp:
     def _on_canvas_configure(self, event):
         # Update width of scrollable frame to match canvas
         self.scroll_frame.itemconfig(self.scroll_id, width=event.width)
+
     def _on_preview_canvas_configure(self, event):
         # Update width of PDF preview content to match canvas
         self.preview_canvas.itemconfig(self.preview_window, width=event.width)
@@ -345,25 +361,6 @@ class InvoiceStamperApp:
             self.preview_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         elif is_form:
             self.scroll_frame.yview_scroll(int(-1*(event.delta/120)), "units")
-        
-    def detect_location(self, filename):
-        # Sort locations by length descending to match longer names first
-        sorted_locs = sorted(LOCATIONS.keys(), key=len, reverse=True)
-        for loc in sorted_locs:
-            if loc.upper() in filename.upper():
-                return loc
-            # Also check if the mapped value is in the filename
-            val = LOCATIONS[loc]
-            if val and val.upper() in filename.upper():
-                return loc
-        return "Unknown"
-
-    def sanitize_filename(self, text):
-        """Remove invalid characters for filenames."""
-        invalid_chars = '<>:"/\\|?*'
-        for char in invalid_chars:
-            text = text.replace(char, '')
-        return "".join(c for c in text if c.isprintable()).strip()
 
     def load_current_pdf(self):
         # Update Back button state
@@ -462,45 +459,37 @@ class InvoiceStamperApp:
         abs_path = invoice["abs_path"]
         filename = invoice["filename"]
         location = invoice["location"]
+        loc_path = invoice["location_path"]
         
-        # Close PDF doc before moving it
+        # Close PDF doc before modifying/moving
         if self.current_pdf_doc:
             self.current_pdf_doc.close()
             self.current_pdf_doc = None
             
-        # Target: Month Path/Locations/Approved/<Location Name>/
-        locations_dir = os.path.join(self.month_path, "Locations")
-        approved_dir = os.path.join(locations_dir, "Approved")
-        dest_dir = os.path.join(approved_dir, location)
-        
-        if not os.path.exists(dest_dir):
-            os.makedirs(dest_dir)
+        # 1. Target directory for the original unstamped file
+        orig_dir = os.path.join(loc_path, "original")
+        if not os.path.exists(orig_dir):
+            os.makedirs(orig_dir)
             
-        base, ext = os.path.splitext(filename)
-        new_filename = f"{base} approved{ext}"
-        dest_path = os.path.join(dest_dir, new_filename)
-        
-        # Handle collision
-        counter = 1
-        while os.path.exists(dest_path):
-            counter += 1
-            dest_path = os.path.join(dest_dir, f"{base} approved_{counter}{ext}")
+        orig_dest_path = os.path.join(orig_dir, filename)
+        if os.path.exists(orig_dest_path):
+            base, ext = os.path.splitext(filename)
+            counter = 1
+            while os.path.exists(orig_dest_path):
+                counter += 1
+                orig_dest_path = os.path.join(orig_dir, f"{base}_{counter}{ext}")
             
         try:
-            # 1. Open PDF and apply secure stamp
+            # 2. Open PDF and apply secure stamp
             doc = fitz.open(abs_path)
             page = doc[0]
             
             # Generate security information
             timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            import socket
-            import getpass
-            import hashlib
-            
             hostname = socket.gethostname()
             username = getpass.getuser()
             
-            # Generate a unique secure hash/code based on document content text and supersecretpassword
+            # Unique cryptographic verification hash
             supersecretpassword = "MarkMotorsGroup_LizaMrak_SecureApproval_2026_Key!"
             
             text_content = []
@@ -521,9 +510,9 @@ class InvoiceStamperApp:
                 hasher.update(str(p.rect.width).encode())
                 hasher.update(str(p.rect.height).encode())
                 
-            hasher.update(hostname.encode())
-            hasher.update(username.encode())
-            hasher.update(timestamp_str.encode())
+            hasher.update(hostname.encode('utf-8'))
+            hasher.update(username.encode('utf-8'))
+            hasher.update(timestamp_str.encode('utf-8'))
             hasher.update(supersecretpassword.encode('utf-8'))
             sec_code = hasher.hexdigest()[:8].upper()
             
@@ -563,17 +552,16 @@ class InvoiceStamperApp:
                 doc.xref_set_key(info_xref, "ApprovedUser", fitz.get_pdf_str(username))
                 doc.xref_set_key(info_xref, "ApprovedHash", fitz.get_pdf_str(sec_code))
             
-            # Save the stamped PDF
-            temp_path = abs_path + ".tmp"
+            # Save the stamped PDF to a temporary file
+            temp_path = abs_path + ".stamped.tmp"
             doc.save(temp_path)
             doc.close()
             
-            # Replace original file with stamped temp file
-            if os.path.exists(temp_path):
-                os.replace(temp_path, abs_path)
-                
-            # 2. Move to destination directory
-            shutil.move(abs_path, dest_path)
+            # 3. Move original unstamped file to the original folder
+            shutil.move(abs_path, orig_dest_path)
+            
+            # 4. Replace file in the corresponding location with the stamped approved copy
+            shutil.move(temp_path, abs_path)
             
             self.pdf_files.pop(self.current_index)
             self.load_current_pdf()
@@ -587,22 +575,26 @@ class InvoiceStamperApp:
         invoice = self.pdf_files[self.current_index]
         abs_path = invoice["abs_path"]
         filename = invoice["filename"]
+        loc_path = invoice["location_path"]
         
         # Close PDF doc before moving
         if self.current_pdf_doc:
             self.current_pdf_doc.close()
             self.current_pdf_doc = None
             
-        file_dir = os.path.dirname(abs_path)
-        base, ext = os.path.splitext(filename)
-        new_filename = f"{base} denyed{ext}"
-        dest_path = os.path.join(file_dir, new_filename)
+        denyed_dir = os.path.join(loc_path, "denyed")
+        if not os.path.exists(denyed_dir):
+            os.makedirs(denyed_dir)
+            
+        dest_path = os.path.join(denyed_dir, filename)
         
         # Handle collision
-        counter = 1
-        while os.path.exists(dest_path):
-            counter += 1
-            dest_path = os.path.join(file_dir, f"{base} denyed_{counter}{ext}")
+        if os.path.exists(dest_path):
+            base, ext = os.path.splitext(filename)
+            counter = 1
+            while os.path.exists(dest_path):
+                counter += 1
+                dest_path = os.path.join(denyed_dir, f"{base}_{counter}{ext}")
             
         try:
             shutil.move(abs_path, dest_path)
@@ -636,9 +628,10 @@ if __name__ == "__main__":
     root.wait_window(selector)
     
     if selector.result:
-        month_path, locations_dir = selector.result
+        month_path = selector.result
         root.deiconify()
         app = InvoiceStamperApp(root, month_path)
         root.mainloop()
     else:
         root.destroy()
+
