@@ -22,7 +22,7 @@ def verify_pdf_signature(pdf_path):
             return False
             
         info_xref = int(val.replace("0 R", "").strip())
-        
+
         # Read custom keys
         _, approved_by = doc.xref_get_key(info_xref, "ApprovedBy")
         _, approved_date = doc.xref_get_key(info_xref, "ApprovedDate")
@@ -61,7 +61,6 @@ def verify_pdf_signature(pdf_path):
             
         doc.close()
             
-        # Mix in the signing event data and the password
         supersecretpassword = "MarkMotorsGroup_LizaMrak_SecureApproval_2026_Key!"
         
         hasher.update(approved_host.encode('utf-8'))
